@@ -208,7 +208,7 @@ def train(cfg: OmegaConf, train_dataset: TextDataset, model: nn.Module, tokenize
                 model.zero_grad()
                 global_step += 1
 
-            if cfg.max_steps > 0 and global_step > cfg.max_steps or step == 1:
+            if cfg.max_steps > 0 and global_step > cfg.max_steps:
                 epoch_iterator.close()
                 break
         
@@ -333,8 +333,6 @@ def evaluate(cfg: OmegaConf, model: nn.Module, tokenizer: PreTrainedTokenizer, p
 
             sp_batch = torch.tensor(sp_batch).mean()
             sp += sp_batch  
-
-        break        
 
     a = perp / len(eval_dataloader)
     perplexity = torch.exp(torch.tensor(a))
