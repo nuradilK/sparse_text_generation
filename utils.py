@@ -9,7 +9,6 @@ import relu_loss
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
-from entmax import sparsemax
 from scipy.stats import entropy
 from itertools import zip_longest
 from pytorch_transformers import PreTrainedTokenizer
@@ -19,24 +18,24 @@ from entmax import SparsemaxLoss, Entmax15Loss, EntmaxBisectLoss, sparsemax, ent
 
 def compute_jsd(p, q, base=np.e):
     p, q = np.asarray(p.cpu()), np.asarray(q.cpu())
-    p, q = p/p.sum(), q/q.sum()
-    m = 1./2*(p + q)
-    ent = entropy(p,m, base=base)/2. + entropy(q, m, base=base)/2.
-    if ent==float('Inf'):
-        ent=torch.log(torch.FloatTensor([2]))
+    p, q = p / p.sum(), q / q.sum()
+    m = 1. / 2 * (p + q)
+    ent = entropy(p, m, base=base) / 2. + entropy(q, m, base=base) / 2.
+    if ent == float('Inf'):
+        ent = torch.log(torch.FloatTensor([2]))
     return ent
 
 
 def compute_sp(p, target):
-    p=np.asarray(p.cpu())
+    p = np.asarray(p.cpu())
     target = target.cpu()
-    return 1-(0.5*np.linalg.norm(p)**2 - p[target]+0.5)
+    return 1 - (0.5 * np.linalg.norm(p)**2 - p[target] + 0.5)
 
 
-def softmax_temperature(X, temperature = 1.0, axis = None):
-    X=X.squeeze(0)
+def softmax_temperature(X, temperature=1.0, axis=None):
+    X = X.squeeze(0)
     for i in range(len(X)):
-        X[i] = X[i]*(1/temperature)
+        X[i] = X[i] * (1 / temperature)
     p = torch.softmax(X, dim=-1)
     return p
 
@@ -47,11 +46,11 @@ def process_chunk(d):
     time"""
 
     d = d.strip() + ' processed'
-    return d 
+    return d
 
 
 def grouper(n, iterable, padvalue=None):
-    return zip_longest(*[iter(iterable)]*n, fillvalue=padvalue)
+    return zip_longest(*[iter(iterable)] * n, fillvalue=padvalue)
 
 
 def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, evaluate=False):
@@ -67,29 +66,32 @@ def set_seed(cfg, n_gpu):
     if n_gpu > 0:
         torch.cuda.manual_seed_all(cfg.seed)
 
-   
-def relu_criterion(z=-1, y=-1, ignore_index=0, vocab_size=50257):
+
+def relu_criterion(z=-1, y=-1, ignore_index=0, vocab_size=50257) -> float:
     if ignore_index == -1:
         return relu_criterion
-    
+
     mse = torch.nn.MSELoss(reduction='sum')
-    y_hat = torch.nn.functional.relu(z)
-    return 0.5 * (mse(z, torch.nn.functional.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)) / z.shape[0]
+    y_hat = F.relu(z)
+    diff = mse(z, F.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)
+    return 0.5 * diff / z.shape[0]
 
 
 def sparsemax_criterion(z=-1, y=-1, ignore_index=0, vocab_size=50257):
-    if ignore_index==-1:
+    if ignore_index == -1:
         return relu_criterion
-    
+
     mse = torch.nn.MSELoss(reduction='sum')
     y_hat = sparsemax(z)
-    return 0.5 * (mse(z, torch.nn.functional.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)) / z.shape[0]
+    diff = mse(z, F.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)
+    return 0.5 * diff / z.shape[0]
 
 
 def mask_tokens(inputs, tokenizer: PreTrainedTokenizer, cfg):
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     labels = inputs.clone()
-    # We sample a few tokens in each sequence for masked-LM training (with probability cfg.mlm_probability defaults to 0.15 in Bert/RoBERTa)
+    # We sample a few tokens in each sequence for masked-LM training
+    # (with probability cfg.mlm_probability defaults to 0.15 in Bert/RoBERTa)
     masked_indices = torch.bernoulli(torch.full(labels.shape, cfg.mlm_probability)).bool()
     labels[~masked_indices] = -1  # We only compute loss on masked tokens
 
@@ -115,7 +117,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
                 Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
         From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
     """
-    #assert logits.dim() == 1  # batch size 1 for now - could be updated for more but the code would be less clear
+    # assert logits.dim() == 1  # batch size 1 for now - could be updated for more but the code would be less clear
     if top_k > 0:
         for i in range(logits.size(0)):
             indices_to_remove = logits[i] < torch.topk(logits[i], top_k)[0][..., -1, None]
@@ -147,11 +149,8 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
     past = None
     for i in range(continuation_length):
         logits, past = model(prev, past=past)
-
         logits = logits[:, -1, :]
-        
         prev = logits.argmax(dim=1, keepdim=True)
-        
         continuation_logits.append(logits)
         output = torch.cat((output, prev), dim=1)
 
@@ -161,11 +160,11 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
 
 def ul_seq(model, batch, cfg):
     input_sequence = batch.cuda()
-    batch = model.batch_input_sequence_by_prefix_length(input_sequence,50)
+    batch = model.batch_input_sequence_by_prefix_length(input_sequence, 50)
     completions, continuation_logits = sample_sequence(model, batch, 50, 100, cfg.top_k, cfg.top_p)
     pred_toks = completions[:, 50:].contiguous()
     mask = ngram_repeat_mask(pred_toks, 4).type_as(continuation_logits)
-    lprobs = torch.nn.functional.log_softmax(continuation_logits, dim=-1)
+    lprobs = F.log_softmax(continuation_logits, dim=-1)
     pred_lprobs = lprobs.view(-1, lprobs.size(2)).gather(1, pred_toks.view(-1, 1))
     one_minus_probs = torch.clamp((1.0 - pred_lprobs.exp()), min=1e-20).view(pred_toks.size(0), pred_toks.size(1))
     loss = -torch.log(one_minus_probs) * mask
@@ -174,18 +173,20 @@ def ul_seq(model, batch, cfg):
 
     loss = loss / ntokens
     return loss
-    
+
 
 def ngram_repeat_mask(xs, n):
     mask = torch.zeros_like(xs)
     for i, x in enumerate(xs):
         seen = set()
         xl = x.tolist()
+
         for j in range(len(x)-n):
             ng = tuple(xl[j:j+n])
             if ng in seen:
                 mask[i, j:j+n] = 1
             seen.add(ng)
+
     return mask
 
 
@@ -207,30 +208,29 @@ def get_criterion_and_gen_func(cfg):
         "entmax": partial(
             entmax_bisect,
             alpha=cfg.entmax_alpha,
-            n_iter=cfg.entmax_bisect_iter
-        ),
+            n_iter=cfg.entmax_bisect_iter),
         "entmax_alpha": "entmax_alpha",
         "relu": F.relu,
         "my_sparsemax": partial(sparsemax_loss.sparsemax, k=cfg.entmax_k)
     }
 
-    return loss_funcs[cfg.loss], gen_funcs[cfg.loss]
+    return loss_funcs[cfg.loss],  gen_funcs[cfg.loss]
 
 
 def get_filename_suffix(cfg):
-    if cfg.loss=='entmax':
+    if cfg.loss == 'entmax':
         return '_entmax_' + str(cfg.entmax_alpha)
-    elif cfg.loss=='entmax15':
+    elif cfg.loss == 'entmax15':
         return '_entmax_1.5'
-    elif cfg.loss=='sparsemax':
+    elif cfg.loss == 'sparsemax':
         return '_sparsemax'
-    elif cfg.loss=='cross_entropy':
+    elif cfg.loss == 'cross_entropy':
         return '_softmax'
-    elif cfg.loss=='entmax_alpha':
+    elif cfg.loss == 'entmax_alpha':
         return '_entmax_alpha'
-    elif cfg.top_p>0:
+    elif cfg.top_p > 0:
         return '_nucleus_' + str(cfg.top_p)
-    elif cfg.loss=='relu':
+    elif cfg.loss == 'relu':
         return 'relu'
-    elif cfg.loss=='my_sparsemax':
+    elif cfg.loss == 'my_sparsemax':
         return 'my_sparsemax'

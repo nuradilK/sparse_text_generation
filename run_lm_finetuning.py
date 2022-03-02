@@ -59,8 +59,7 @@ class TextDataset(Dataset):
             tokenizer: PreTrainedTokenizer,
             cfg: OmegaConf,
             file_path: str,
-            block_size=512
-            ):
+            block_size=512):
 
         assert os.path.isfile(file_path)
 
@@ -181,14 +180,23 @@ def train(
             shift_labels.view(-1))
         return loss
 
+    def save_model(output_dir):
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        # Take care of distributed/parallel training
+        model_to_save = model.module if hasattr(model, 'module') else model
+        model_to_save.save_pretrained(output_dir)
+        torch.save(cfg, os.path.join(output_dir, 'training_args.bin'))
+        logging.info("Saving model checkpoint to %s", output_dir)
+
     global_step, tr_loss, logging_loss = 0, 0.0, 0.0
-    model.train()
-    model.zero_grad()
     utils.set_seed(cfg, n_gpu)  # Added here for reproducibility (even between python 2 and 3)s
     train_iterator = trange(int(cfg.num_train_epochs), desc="Epoch", disable=cfg.local_rank not in [-1, 0])
     best_jsd, best_ppl, best_sp = 100000, 100000, 0
 
     for epoch in train_iterator:
+        model.train()
+        model.zero_grad()
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=cfg.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             inputs, labels = utils.mask_tokens(batch, tokenizer, cfg) if cfg.mlm else (batch, batch)
@@ -238,46 +246,25 @@ def train(
             # Log metrics
             # Only evaluate when single GPU otherwise metrics may not average well
             if cfg.local_rank == -1 and cfg.evaluate_during_training:
-                jsd, ppl, sp = evaluate(cfg, model, tokenizer, gen_func=gen_func, top_p=cfg.top_p)
+                jsd, ppl, sp = evaluate(cfg, model, tokenizer, gen_func=gen_func)
                 tb_writer.add_scalar('eval_jsd', jsd, epoch)
                 tb_writer.add_scalar('eval_ppl', ppl, epoch)
                 tb_writer.add_scalar('eval_sp', sp, epoch)
 
             tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
-            tb_writer.add_scalar('loss', (tr_loss - logging_loss) / cfg.logging_steps, epoch)
+            tb_writer.add_scalar('loss', (tr_loss - logging_loss) / len(train_dataloader), epoch)
             logging_loss = tr_loss
 
             # Save model checkpoint
             if jsd < best_jsd:
                 best_jsd = jsd
-                output_dir = os.path.join(cfg.output_dir+'/best_jsd', 'checkpoint')
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                # Take care of distributed/parallel training
-                model_to_save = model.module if hasattr(model, 'module') else model
-                model_to_save.save_pretrained(output_dir)
-                torch.save(cfg, os.path.join(output_dir, 'training_args.bin'))
-                logging.info("Saving model checkpoint to %s", output_dir)
+                save_model(output_dir=os.path.join(cfg.output_dir+'/best_jsd', 'checkpoint'))
             if ppl < best_ppl:
                 best_ppl = ppl
-                output_dir = os.path.join(cfg.output_dir+'/best_ppl', 'checkpoint')
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                # Take care of distributed/parallel training
-                model_to_save = model.module if hasattr(model, 'module') else model
-                model_to_save.save_pretrained(output_dir)
-                torch.save(cfg, os.path.join(output_dir, 'training_args.bin'))
-                logging.info("Saving model checkpoint to %s", output_dir)
+                save_model(output_dir=os.path.join(cfg.output_dir+'/best_ppl', 'checkpoint'))
             if sp > best_sp:
                 best_sp = sp
-                output_dir = os.path.join(cfg.output_dir+'/best_sp', 'checkpoint')
-                if not os.path.exists(output_dir):
-                    os.makedirs(output_dir)
-                # Take care of distributed/parallel training
-                model_to_save = model.module if hasattr(model, 'module') else model
-                model_to_save.save_pretrained(output_dir)
-                torch.save(cfg, os.path.join(output_dir, 'training_args.bin'))
-                logging.info("Saving model checkpoint to %s", output_dir)
+                save_model(output_dir=os.path.join(cfg.output_dir+'/best_sp', 'checkpoint'))
 
         if cfg.max_steps > 0 and global_step > cfg.max_steps:
             train_iterator.close()
@@ -314,9 +301,8 @@ def evaluate(
     logging.info("  Num examples = %d", len(eval_dataset))
     logging.info("  Batch size = %d", eval_batch_size)
 
-    perp = 0.0
     model.eval()
-    jsd, sp = 0, 0
+    perp, jsd, sp = 0, 0, 0
 
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
         batch = batch.to(device)
@@ -326,7 +312,7 @@ def evaluate(
 
             shift_logits = logits[..., :-1, :].contiguous()
             shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-            shift_labels = batch[..., 1:].contiguous().squeeze(0)
+            shift_labels = batch[..., 1:].contiguous().squeeze(0).view(-1)
 
             if cfg.temp != 0:
                 probs = utils.softmax_temperature(shift_logits, temperature=cfg.temp, axis=1)
@@ -342,12 +328,12 @@ def evaluate(
             lprobs = probs
 
             if len(probs[0].nonzero()) != len(probs[0]):
-                probs = probs[:, :]+cfg.epsilon
+                probs = probs[:, :] + cfg.epsilon
                 sums = [probs[i].sum().item() for i in range(probs.size(0))]
                 probs = [probs[i] / sums[i] for i in range(len(sums))]
                 probs = torch.stack(probs)
 
-            p = [probs[i, shift_labels.squeeze(0)[i]] for i in range(len(shift_labels.squeeze(0)))]
+            p = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
             p = torch.stack(p)
             perp += torch.log(p**(-1)).mean().item()
 
@@ -359,8 +345,7 @@ def evaluate(
                 if jsd_ != float('Inf'):
                     jsd_batch.append(jsd_)
 
-            jsd_batch = torch.tensor(jsd_batch).mean()
-            jsd += jsd_batch
+            jsd += torch.tensor(jsd_batch).mean()
 
             sp_batch = []
             for i in range(len(shift_labels)):
@@ -369,8 +354,7 @@ def evaluate(
             sp_batch = torch.tensor(sp_batch).mean()
             sp += sp_batch
 
-    a = perp / len(eval_dataloader)
-    perplexity = torch.exp(torch.tensor(a))
+    perplexity = torch.exp(torch.tensor(perp / len(eval_dataloader)))
     jsd = jsd / len(eval_dataloader)
     sp = sp / len(eval_dataloader)
 
