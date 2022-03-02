@@ -31,7 +31,7 @@ loss: "entmax"  # "Loss function to use for fine-tuning (only for GPT-2 so far)"
 top_p: 0  
 top_k: 0  
 entmax_alpha: 1.2  
-entmax_k: 512  
+entmax_k: 256  
 entmax_bisect_iter: 50  
 eval_metric: 'jsd'  
 logging_steps: 10000  # "Log every X updates steps."

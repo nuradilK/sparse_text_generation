@@ -188,7 +188,7 @@ def train(
     train_iterator = trange(int(cfg.num_train_epochs), desc="Epoch", disable=cfg.local_rank not in [-1, 0])
     best_jsd, best_ppl, best_sp = 100000, 100000, 0
 
-    for _ in train_iterator:
+    for epoch in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=cfg.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             inputs, labels = utils.mask_tokens(batch, tokenizer, cfg) if cfg.mlm else (batch, batch)
@@ -210,6 +210,7 @@ def train(
                 loss = loss / cfg.gradient_accumulation_steps
 
             epoch_iterator.set_description(f"batch loss: {format(loss.item(), '.2f')}")
+            tb_writer.add_scalar('train_loss', loss, global_step)
 
             if cfg.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -238,12 +239,12 @@ def train(
             # Only evaluate when single GPU otherwise metrics may not average well
             if cfg.local_rank == -1 and cfg.evaluate_during_training:
                 jsd, ppl, sp = evaluate(cfg, model, tokenizer, gen_func=gen_func, top_p=cfg.top_p)
-                tb_writer.add_scalar('eval_jsd', jsd, global_step)
-                tb_writer.add_scalar('eval_ppl', ppl, global_step)
-                tb_writer.add_scalar('eval_sp', sp, global_step)
+                tb_writer.add_scalar('eval_jsd', jsd, epoch)
+                tb_writer.add_scalar('eval_ppl', ppl, epoch)
+                tb_writer.add_scalar('eval_sp', sp, epoch)
 
-            tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
-            tb_writer.add_scalar('loss', (tr_loss - logging_loss)/cfg.logging_steps, global_step)
+            tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
+            tb_writer.add_scalar('loss', (tr_loss - logging_loss) / cfg.logging_steps, epoch)
             logging_loss = tr_loss
 
             # Save model checkpoint
@@ -439,6 +440,7 @@ def main(cfg: OmegaConf):
         # Barrier to make sure only the first process in distributed training download model & vocab
         torch.distributed.barrier()
 
+    # Set up model and tokenizer
     config_class, model_class, tokenizer_class = MODEL_CLASSES[cfg.model_type]
     config = (
         config_class.from_pretrained(
@@ -447,6 +449,7 @@ def main(cfg: OmegaConf):
     tokenizer = tokenizer_class.from_pretrained(
         cfg.tokenizer_name if cfg.tokenizer_name else cfg.model_name_or_path,
         do_lower_case=cfg.do_lower_case)
+
     # Our input block size will be the max possible for the model
     cfg.block_size = tokenizer.max_len if cfg.block_size <= 0 else cfg.block_size
     loss_func, gen_func = utils.get_criterion_and_gen_func(cfg)
@@ -455,8 +458,7 @@ def main(cfg: OmegaConf):
         model = model_class.from_pretrained(
             cfg.model_name_or_path,
             from_tf='.ckpt' in cfg.model_name_or_path,
-            config=config,
-        )
+            config=config)
     else:
         logging.info("Training new model from scratch")
         model = model_class(config=config)
@@ -489,6 +491,7 @@ def main(cfg: OmegaConf):
             gen_func,
             n_gpu=n_gpu,
             device=device)
+
         logging.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Saving best-practices: if you use save_pretrained for the model and tokenizer,
