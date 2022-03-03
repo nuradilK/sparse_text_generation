@@ -1,7 +1,8 @@
 # @package _global_
 train_data_file: "/home/nuradil/data/wikitext-2/wiki.train.tokens"  # "The input training data file (a text file)."
-output_dir: "/home/nuradil/sparse_text_generation/models/entmax1.2_new"  # "The output directory where the model predictions and checkpoints will be written."
-eval_data_file: "/home/nuradil/data/wikitext-2/wiki.test.tokens"  # "An optional input evaluation data file to evaluate the perplexity on (a text file)." 
+output_dir: "/home/nuradil/sparse_text_generation/models/entmax1.2_foo"  # "The output directory where the model predictions and checkpoints will be written."
+eval_data_file: "/home/nuradil/data/wikitext-2/wiki.valid.tokens"  # "An optional input evaluation data file to evaluate the perplexity on (a text file)." 
+test_data_file: "/home/nuradil/data/wikitext-2/wiki.test.tokens"  # "An optional input evaluation data file to evaluate the perplexity on (a text file)." 
 model_type: "gpt2" # " The model architecture to be fine-tuned."
 model_name_or_path: "gpt2-medium"  # "The model checkpoint for weights initialization."
 mlm: False # "Train with masked-language modeling loss instead of language modeling."
@@ -11,7 +12,6 @@ tokenizer_name: ""  # "Optional pretrained tokenizer name or path if not the sam
 cache_dir: ""  # "Optional directory to store the pre-trained models downloaded from s3 (instread of the defauult one)"
 block_size: 256  # "Optional input sequence length after tokenization. The training dataset will be truncated in block of this size for training."       "Defauzlt to the model max input length for single sentence inputs (take into account special tokens)."
 do_train: True # "Whether to run training."
-do_eval: False # "Whether to run eval on the dev set."
 evaluate_during_training: True # "Run evaluation during training  each logging step."
 do_lower_case: False # "Set this flag if you are using an uncased model."
 calibration_par: 0.1  # "Calibration parameter"
@@ -34,7 +34,7 @@ entmax_alpha: 1.2
 entmax_k: 256  
 entmax_bisect_iter: 50  
 eval_metric: 'jsd'  
-logging_steps: 10000  # "Log every X updates steps."
+logging_steps: 1200  # "Log every X updates steps."
 temp: 0  
 save_steps: 10000  # "Save checkpoint every X updates steps."
 eval_all_checkpoints: False # "Evaluate all checkpoints starting with the same prefix as model_name_or_path ending and ending with step number"
@@ -50,3 +50,4 @@ server_port: ''  # "For distant debugging."
 unlikelihood_seq: False
 n_gpu: 
 device: 
+calculate_batch_scores: True

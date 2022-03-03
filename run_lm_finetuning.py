@@ -31,6 +31,7 @@ import utils
 from omegaconf import OmegaConf
 
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
@@ -104,7 +105,6 @@ class TextDataset(Dataset):
 
 def train(
         cfg: OmegaConf,
-        train_dataset: TextDataset,
         model: nn.Module,
         tokenizer: PreTrainedTokenizer,
         loss_func,
@@ -116,15 +116,10 @@ def train(
     if cfg.local_rank in [-1, 0]:
         tb_writer = SummaryWriter(filename_suffix=utils.get_filename_suffix(cfg))
 
+    train_dataset = TextDataset(tokenizer, cfg, file_path=cfg.train_data_file, block_size=cfg.block_size)
     train_batch_size = cfg.per_gpu_train_batch_size * max(1, n_gpu)
     train_sampler = RandomSampler(train_dataset) if cfg.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, shuffle=False, sampler=train_sampler, batch_size=train_batch_size)
-
-    if cfg.max_steps > 0:
-        t_total = cfg.max_steps
-        cfg.num_train_epochs = cfg.max_steps // (len(train_dataloader) // cfg.gradient_accumulation_steps) + 1
-    else:
-        t_total = len(train_dataloader) // cfg.gradient_accumulation_steps * cfg.num_train_epochs
 
     # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ['bias', 'LayerNorm.weight']
@@ -139,6 +134,12 @@ def train(
         }
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon)
+
+    if cfg.max_steps > 0:
+        t_total = cfg.max_steps
+        cfg.num_train_epochs = cfg.max_steps // (len(train_dataloader) // cfg.gradient_accumulation_steps) + 1
+    else:
+        t_total = len(train_dataloader) // cfg.gradient_accumulation_steps * cfg.num_train_epochs
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=cfg.warmup_steps, t_total=t_total)
 
     if cfg.fp16:
@@ -170,16 +171,6 @@ def train(
     logging.info("  Gradient Accumulation steps = %d", cfg.gradient_accumulation_steps)
     logging.info("  Total optimization steps = %d", t_total)
 
-    def calculate_loss(logits, labels, loss_func):
-        # Shift so that tokens < n predict n
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-        # Flatten the tokens
-        loss = loss_func(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1))
-        return loss
-
     def save_model(output_dir):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -192,12 +183,14 @@ def train(
     global_step, tr_loss, logging_loss = 0, 0.0, 0.0
     utils.set_seed(cfg, n_gpu)  # Added here for reproducibility (even between python 2 and 3)s
     train_iterator = trange(int(cfg.num_train_epochs), desc="Epoch", disable=cfg.local_rank not in [-1, 0])
-    best_jsd, best_ppl, best_sp = 100000, 100000, 0
+    best_jsd, best_ppl, best_sp, best_loss = 100000, 100000, 0, 100000
 
-    for epoch in train_iterator:
+    for _ in train_iterator:
         model.train()
         model.zero_grad()
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=cfg.local_rank not in [-1, 0])
+
+        # Train epoch
         for step, batch in enumerate(epoch_iterator):
             inputs, labels = utils.mask_tokens(batch, tokenizer, cfg) if cfg.mlm else (batch, batch)
             inputs = inputs.to(device)
@@ -210,15 +203,26 @@ def train(
                     loss = utils.ul_seq(model, inputs, cfg)
             else:
                 _, logits, _ = model(inputs) if cfg.mlm else model(inputs, labels=labels)
-                loss = calculate_loss(logits, labels, loss_func)
+                loss = utils.calculate_loss(logits, labels, loss_func)
 
             if n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
             if cfg.gradient_accumulation_steps > 1:
                 loss = loss / cfg.gradient_accumulation_steps
 
-            epoch_iterator.set_description(f"batch loss: {format(loss.item(), '.2f')}")
-            tb_writer.add_scalar('train_loss', loss, global_step)
+            if cfg.calculate_batch_scores:
+                batch_jsd, batch_perp, batch_sp = utils.calculate_metrics(cfg, logits, batch, gen_func)
+
+                epoch_iterator.set_description("loss: {}, perp: {}, jsd: {}, sp: {}".format(
+                    format(loss.item(), '.2f'),
+                    format(batch_perp.item(), '.2f'),
+                    format(batch_jsd.item(), '.2f'),
+                    format(batch_sp.item(), '.2f'),))
+
+                tb_writer.add_scalar('train_batch_loss', loss, global_step)
+                tb_writer.add_scalar('train_batch_perp', batch_perp, global_step)
+                tb_writer.add_scalar('train_batch_jsd', batch_jsd, global_step)
+                tb_writer.add_scalar('train_batch_sp', batch_sp, global_step)
 
             if cfg.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
@@ -241,30 +245,46 @@ def train(
                 epoch_iterator.close()
                 break
 
-        # EVAL
-        if cfg.local_rank in [-1, 0]:
-            # Log metrics
-            # Only evaluate when single GPU otherwise metrics may not average well
-            if cfg.local_rank == -1 and cfg.evaluate_during_training:
-                jsd, ppl, sp = evaluate(cfg, model, tokenizer, gen_func=gen_func)
-                tb_writer.add_scalar('eval_jsd', jsd, epoch)
-                tb_writer.add_scalar('eval_ppl', ppl, epoch)
-                tb_writer.add_scalar('eval_sp', sp, epoch)
+            if global_step % cfg.logging_steps == 0:
+                # EVAL
+                if cfg.local_rank in [-1, 0]:
+                    # Log metrics
+                    # Only evaluate when single GPU otherwise metrics may not average well
+                    if cfg.local_rank == -1 and cfg.evaluate_during_training:
+                        jsd, ppl, sp, repeat, wrong_repeat, loss = evaluate(
+                            cfg, model, tokenizer, cfg.eval_data_file,
+                            prefix='validation', gen_func=gen_func)
+                        tb_writer.add_scalar('eval_jsd', jsd, global_step)
+                        tb_writer.add_scalar('eval_ppl', ppl, global_step)
+                        tb_writer.add_scalar('eval_sp', sp, global_step)
+                        tb_writer.add_scalar('eval_loss', scaled_loss, global_step)
 
-            tb_writer.add_scalar('lr', scheduler.get_lr()[0], epoch)
-            tb_writer.add_scalar('loss', (tr_loss - logging_loss) / len(train_dataloader), epoch)
-            logging_loss = tr_loss
+                        for context_length in [16, 32, 128, 512]:
+                            tb_writer.add_scalar(f'repeat_{context_length}', repeat[context_length], global_step)
+                            tb_writer.add_scalar(
+                                f'wrong_repeat_{context_length}',
+                                wrong_repeat[context_length], global_step)
 
-            # Save model checkpoint
-            if jsd < best_jsd:
-                best_jsd = jsd
-                save_model(output_dir=os.path.join(cfg.output_dir+'/best_jsd', 'checkpoint'))
-            if ppl < best_ppl:
-                best_ppl = ppl
-                save_model(output_dir=os.path.join(cfg.output_dir+'/best_ppl', 'checkpoint'))
-            if sp > best_sp:
-                best_sp = sp
-                save_model(output_dir=os.path.join(cfg.output_dir+'/best_sp', 'checkpoint'))
+                    tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
+                    tb_writer.add_scalar(
+                        'train_epoch_loss',
+                        (tr_loss - logging_loss) / len(train_dataloader),
+                        global_step)
+                    logging_loss = tr_loss
+
+                    # Save model checkpoint
+                    if jsd < best_jsd:
+                        best_jsd = jsd
+                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_jsd', 'checkpoint'))
+                    if ppl < best_ppl:
+                        best_ppl = ppl
+                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_ppl', 'checkpoint'))
+                    if sp > best_sp:
+                        best_sp = sp
+                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_sp', 'checkpoint'))
+                    if loss < best_loss:
+                        best_loss = loss
+                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_val_loss', 'checkpoint'))
 
         if cfg.max_steps > 0 and global_step > cfg.max_steps:
             train_iterator.close()
@@ -276,17 +296,20 @@ def train(
     return global_step, tr_loss / global_step
 
 
+@torch.no_grad()
 def evaluate(
         cfg: OmegaConf,
         model: nn.Module,
         tokenizer: PreTrainedTokenizer,
+        file_path,
+        loss_func=None,
         prefix="",
         gen_func=torch.softmax,
         n_gpu=0,
         device=None) -> tuple:
 
     # Loop to handle MNLI double evaluation (matched, mis-matched)
-    eval_dataset = utils.load_and_cache_examples(cfg, tokenizer, evaluate=True)
+    eval_dataset = TextDataset(tokenizer, cfg, file_path=file_path, block_size=cfg.block_size)
 
     if not os.path.exists(cfg.output_dir) and cfg.local_rank in [-1, 0]:
         os.makedirs(cfg.output_dir)
@@ -302,73 +325,55 @@ def evaluate(
     logging.info("  Batch size = %d", eval_batch_size)
 
     model.eval()
-    perp, jsd, sp = 0, 0, 0
+    perp, jsd, sp, loss = 0, 0, 0, 0
+    repeat, wrong_repeat = [{16: [], 32: [], 128: [], 512: []}] * 2
 
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        batch = batch.to(device)
+        inputs, labels = utils.mask_tokens(batch, tokenizer, cfg) if cfg.mlm else (batch, batch)
+        inputs = inputs.to(device)
+        labels = labels.to(device)
 
-        with torch.no_grad():
-            _, logits, _ = model(batch, masked_lm_labels=batch) if cfg.mlm else model(batch, labels=batch)
+        _, logits, _ = model(inputs) if cfg.mlm else model(inputs, labels=labels)
 
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-            shift_labels = batch[..., 1:].contiguous().squeeze(0).view(-1)
+        batch_jsd, batch_perp, batch_sp = utils.calculate_metrics(
+            cfg, logits, batch, gen_func, repeat, wrong_repeat)
 
-            if cfg.temp != 0:
-                probs = utils.softmax_temperature(shift_logits, temperature=cfg.temp, axis=1)
-            elif cfg.top_p > 0 or cfg.top_k > 0:
-                shift_logits = utils.top_k_top_p_filtering(
-                    shift_logits,
-                    top_p=cfg.top_p,
-                    top_k=cfg.top_k,
-                    gen_func=gen_func)
-                probs = gen_func(shift_logits, dim=1)
-            else:
-                probs = gen_func(shift_logits, dim=1)
-            lprobs = probs
+        perp += batch_perp
+        jsd += batch_jsd
+        sp += batch_sp
 
-            if len(probs[0].nonzero()) != len(probs[0]):
-                probs = probs[:, :] + cfg.epsilon
-                sums = [probs[i].sum().item() for i in range(probs.size(0))]
-                probs = [probs[i] / sums[i] for i in range(len(sums))]
-                probs = torch.stack(probs)
+        if loss_func is not None:
+            loss += utils.calculate_loss(logits, labels, loss_func)
 
-            p = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
-            p = torch.stack(p)
-            perp += torch.log(p**(-1)).mean().item()
+    perp = torch.exp(perp / len(eval_dataloader))
+    jsd /= len(eval_dataloader)
+    sp /= len(eval_dataloader)
+    loss /= len(eval_dataloader)
 
-            jsd_batch = []
-            labels = torch.zeros(len(shift_labels), shift_logits.size(-1))
-            for i in range(len(shift_labels)):
-                labels[i, shift_labels[i]] = 1
-                jsd_ = utils.compute_jsd(lprobs[i], labels[i])
-                if jsd_ != float('Inf'):
-                    jsd_batch.append(jsd_)
-
-            jsd += torch.tensor(jsd_batch).mean()
-
-            sp_batch = []
-            for i in range(len(shift_labels)):
-                sp_batch.append(utils.compute_sp(lprobs.squeeze(0)[i], shift_labels[i]))
-
-            sp_batch = torch.tensor(sp_batch).mean()
-            sp += sp_batch
-
-    perplexity = torch.exp(torch.tensor(perp / len(eval_dataloader)))
-    jsd = jsd / len(eval_dataloader)
-    sp = sp / len(eval_dataloader)
+    for context_length in [16, 32, 128, 512]:
+        repeat[context_length] = np.array(repeat[context_length]).mean()
+        wrong_repeat[context_length] = np.array(wrong_repeat[context_length]).mean()
 
     output_eval_file = os.path.join(cfg.output_dir, "eval_results.txt")
     with open(output_eval_file, "a") as writer:
         logging.info("***** Eval results {} *****".format(prefix))
-        logging.info(f'perplexity: {perplexity}')
+        logging.info(f'perplexity: {perp}')
         logging.info(f'js: {jsd}')
-        logging.info(f'sp; {sp}')
-        writer.write(f'perplexity: {perplexity}\n')
+        logging.info(f'sp: {sp}')
+        writer.write(f'perplexity: {perp}\n')
         writer.write(f'js: {jsd}\n')
-        writer.write(f'sp; {sp}\n')
+        writer.write(f'sp: {sp}\n')
+        if loss_func is not None:
+            logging.info(f'loss: {loss}')
+            writer.write(f'loss: {loss}\n')
 
-    return jsd, perplexity, sp
+        for context_length in [16, 32, 128, 512]:
+            logging.info(f'repeat_{context_length}: {repeat[context_length]}')
+            logging.info(f'wrong_repeat_{context_length}: {wrong_repeat[context_length]}')
+            writer.write(f'repeat_{context_length}: {repeat[context_length]}')
+            writer.write(f'wrong_repeat_{context_length}: {wrong_repeat[context_length]}')
+
+    return jsd, perp, sp, repeat, wrong_repeat, loss
 
 
 @hydra.main(config_path="cfg", config_name="config.yaml")
@@ -461,20 +466,13 @@ def main(cfg: OmegaConf):
             # and the others will use the cache
             torch.distributed.barrier()
 
-        train_dataset = utils.load_and_cache_examples(cfg, tokenizer, evaluate=False)
-
         if cfg.local_rank == 0:
             torch.distributed.barrier()
 
         global_step, tr_loss = train(
-            cfg,
-            train_dataset,
-            model,
-            tokenizer,
-            loss_func,
-            gen_func,
-            n_gpu=n_gpu,
-            device=device)
+            cfg, model, tokenizer, 
+            loss_func, gen_func,
+            n_gpu=n_gpu, device=device)
 
         logging.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
@@ -502,7 +500,7 @@ def main(cfg: OmegaConf):
         model.to(device)
 
     # Evaluation
-    if cfg.do_eval and cfg.local_rank in [-1, 0]:
+    if cfg.test_data_file and cfg.local_rank in [-1, 0]:
         checkpoints = [cfg.output_dir]
 
         if cfg.eval_all_checkpoints:
@@ -513,18 +511,14 @@ def main(cfg: OmegaConf):
 
         for checkpoint in checkpoints:
             global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
-            model = model_class.from_pretrained(checkpoint, loss=loss_func, gen_func=gen_func)
+            model = model_class.from_pretrained(checkpoint)
+            model.eval()
             model.to(device)
 
             evaluate(
-                cfg,
-                model,
-                tokenizer,
-                prefix=global_step,
-                gen_func=gen_func,
-                top_p=cfg.top_p,
-                n_gpu=n_gpu,
-                device=device)
+                cfg, model, tokenizer, cfg.test_data_file,
+                prefix=global_step, gen_func=gen_func,
+                n_gpu=n_gpu, device=device)
 
 
 if __name__ == "__main__":

@@ -3,21 +3,33 @@ from __future__ import absolute_import, division, print_function
 import random
 
 import numpy as np
+from omegaconf import OmegaConf
 import torch
-import sparsemax_loss
-import relu_loss
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from scipy.stats import entropy
 from itertools import zip_longest
 from pytorch_transformers import PreTrainedTokenizer
-from run_lm_finetuning import TextDataset
 from entmax import SparsemaxLoss, Entmax15Loss, EntmaxBisectLoss, sparsemax, entmax15, entmax_bisect
 
 
-def compute_jsd(p, q, base=np.e):
-    p, q = np.asarray(p.cpu()), np.asarray(q.cpu())
+def calculate_loss(logits, labels, loss_func):
+    # Shift so that tokens < n predict n
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+    # Flatten the tokens
+    loss = loss_func(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1))
+    return loss
+
+
+def compute_jsd(p, q, base=np.e) -> torch.tensor:
+    p, q = p.cpu(), q.cpu()
+    p = p.detach().numpy()
+    q = q.detach().numpy()
     p, q = p / p.sum(), q / q.sum()
     m = 1. / 2 * (p + q)
     ent = entropy(p, m, base=base) / 2. + entropy(q, m, base=base) / 2.
@@ -26,13 +38,13 @@ def compute_jsd(p, q, base=np.e):
     return ent
 
 
-def compute_sp(p, target):
-    p = np.asarray(p.cpu())
+def compute_sp(p, target) -> float:
+    p = np.asarray(p.cpu().detach().numpy())
     target = target.cpu()
     return 1 - (0.5 * np.linalg.norm(p)**2 - p[target] + 0.5)
 
 
-def softmax_temperature(X, temperature=1.0, axis=None):
+def softmax_temperature(X, temperature=1.0, axis=None) -> torch.tensor:
     X = X.squeeze(0)
     for i in range(len(X)):
         X[i] = X[i] * (1 / temperature)
@@ -49,14 +61,8 @@ def process_chunk(d):
     return d
 
 
-def grouper(n, iterable, padvalue=None):
+def grouper(n, iterable, padvalue=None) -> zip_longest:
     return zip_longest(*[iter(iterable)] * n, fillvalue=padvalue)
-
-
-def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, evaluate=False):
-    file_path = cfg.eval_data_file if evaluate else cfg.train_data_file
-    dataset = TextDataset(tokenizer, cfg, file_path=file_path, block_size=cfg.block_size)
-    return dataset
 
 
 def set_seed(cfg, n_gpu):
@@ -67,27 +73,7 @@ def set_seed(cfg, n_gpu):
         torch.cuda.manual_seed_all(cfg.seed)
 
 
-def relu_criterion(z=-1, y=-1, ignore_index=0, vocab_size=50257) -> float:
-    if ignore_index == -1:
-        return relu_criterion
-
-    mse = torch.nn.MSELoss(reduction='sum')
-    y_hat = F.relu(z)
-    diff = mse(z, F.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)
-    return 0.5 * diff / z.shape[0]
-
-
-def sparsemax_criterion(z=-1, y=-1, ignore_index=0, vocab_size=50257):
-    if ignore_index == -1:
-        return relu_criterion
-
-    mse = torch.nn.MSELoss(reduction='sum')
-    y_hat = sparsemax(z)
-    diff = mse(z, F.one_hot(y, num_classes=vocab_size).float().cuda()) - mse(z, y_hat)
-    return 0.5 * diff / z.shape[0]
-
-
-def mask_tokens(inputs, tokenizer: PreTrainedTokenizer, cfg):
+def mask_tokens(inputs, tokenizer: PreTrainedTokenizer, cfg) -> tuple:
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
     labels = inputs.clone()
     # We sample a few tokens in each sequence for masked-LM training
@@ -139,7 +125,7 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')
     return logits
 
 
-def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top_k, top_p):
+def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top_k, top_p) -> tuple:
     continuation_logits = []
     context = prefix_batch
     assert context.size(1) == prefix_length
@@ -147,7 +133,7 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
     prev = context
     output = context
     past = None
-    for i in range(continuation_length):
+    for _ in range(continuation_length):
         logits, past = model(prev, past=past)
         logits = logits[:, -1, :]
         prev = logits.argmax(dim=1, keepdim=True)
@@ -158,7 +144,7 @@ def sample_sequence(model, prefix_batch, prefix_length, continuation_length, top
     return output, continuation_logits
 
 
-def ul_seq(model, batch, cfg):
+def ul_seq(model, batch, cfg) -> torch.tensor:
     input_sequence = batch.cuda()
     batch = model.batch_input_sequence_by_prefix_length(input_sequence, 50)
     completions, continuation_logits = sample_sequence(model, batch, 50, 100, cfg.top_k, cfg.top_p)
@@ -175,7 +161,7 @@ def ul_seq(model, batch, cfg):
     return loss
 
 
-def ngram_repeat_mask(xs, n):
+def ngram_repeat_mask(xs, n) -> torch.tensor:
     mask = torch.zeros_like(xs)
     for i, x in enumerate(xs):
         seen = set()
@@ -190,15 +176,13 @@ def ngram_repeat_mask(xs, n):
     return mask
 
 
-def get_criterion_and_gen_func(cfg):
+def get_criterion_and_gen_func(cfg) -> tuple:
     loss_funcs = {
         "cross_entropy": nn.CrossEntropyLoss(ignore_index=-1),
         "sparsemax": SparsemaxLoss(k=cfg.entmax_k, ignore_index=-1),
         "entmax15": Entmax15Loss(k=cfg.entmax_k, ignore_index=-1),
         "entmax": EntmaxBisectLoss(alpha=cfg.entmax_alpha, n_iter=cfg.entmax_bisect_iter, ignore_index=-1),
-        "entmax_alpha": "entmax_alpha",
-        "relu": relu_loss.ReluLoss(ignore_index=-1),
-        "my_sparsemax": sparsemax_loss.SparsemaxLoss(k=cfg.entmax_k, ignore_index=-1)
+        "entmax_alpha": "entmax_alpha"
     }
 
     gen_funcs = {
@@ -209,9 +193,7 @@ def get_criterion_and_gen_func(cfg):
             entmax_bisect,
             alpha=cfg.entmax_alpha,
             n_iter=cfg.entmax_bisect_iter),
-        "entmax_alpha": "entmax_alpha",
-        "relu": F.relu,
-        "my_sparsemax": partial(sparsemax_loss.sparsemax, k=cfg.entmax_k)
+        "entmax_alpha": "entmax_alpha"
     }
 
     return loss_funcs[cfg.loss],  gen_funcs[cfg.loss]
@@ -234,3 +216,84 @@ def get_filename_suffix(cfg):
         return 'relu'
     elif cfg.loss == 'my_sparsemax':
         return 'my_sparsemax'
+
+
+def repeat_at_1(predictions, targets, context_length: int, topk=0, topp=0.0) -> tuple:
+    predictions = torch.tensor(predictions).cpu()
+    targets = targets.unsqueeze(0)
+    T = targets.size(1)
+    assert predictions.size(0) == T
+
+    # T x T where prev_targets[t, :] = [y_1,...,y_t-1, -1, -1,..., -1]
+    prev_targets = targets.expand(T, T).tril().masked_fill_(
+        torch.ones_like(targets.expand(T, T)).byte().triu().bool(),
+        -1)
+
+    # each row t is [-1, ..., -1, y_{t-k-1}, ..., y_{t-1}, -1, ..., -1] where k is context length
+    prev_targets = prev_targets.masked_fill_(
+        torch.ones_like(targets.expand(T, T)).byte().tril(-(context_length+1)).bool(),
+        -1)
+    prev_targets = torch.tensor(prev_targets).cpu()
+
+    repeat_at_1 = (predictions[:, None] == prev_targets)
+    has_repeat_at_1 = repeat_at_1.sum(1).gt(0)
+    total_repeat_at_1 = has_repeat_at_1.sum()
+
+    is_incorrect = (predictions != targets.view(-1)).view(-1, 1)
+    total_wrong_repeat_at_1 = ((repeat_at_1 * is_incorrect).sum(1).gt(0)).sum()
+
+    return total_repeat_at_1.item() / float(targets.size(1)), total_wrong_repeat_at_1.item()/float(targets.size(1))
+
+
+def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repeat=None, wrong_repeat=None) -> tuple:
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    shift_labels = batch[..., 1:].contiguous().squeeze(0).view(-1)
+
+    if cfg.temp != 0:
+        probs = softmax_temperature(shift_logits, temperature=cfg.temp, axis=1)
+    else:
+        if cfg.top_p > 0 or cfg.top_k > 0:
+            shift_logits = top_k_top_p_filtering(
+                shift_logits,
+                top_p=cfg.top_p,
+                top_k=cfg.top_k,
+                gen_func=gen_func)
+        probs = gen_func(shift_logits, dim=1)
+    lprobs = probs
+
+    if len(probs[0].nonzero()) != len(probs[0]):
+        probs = probs[:, :] + cfg.epsilon
+        sums = [probs[i].sum().item() for i in range(probs.size(0))]
+        probs = [probs[i] / sums[i] for i in range(len(sums))]
+        probs = torch.stack(probs)
+
+    p = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
+    p = torch.stack(p)
+
+    sp_batch, jsd_batch = [], []
+    labels = torch.zeros(len(shift_labels), shift_logits.size(-1))
+    for i in range(len(shift_labels)):
+        labels[i, shift_labels[i]] = 1
+        jsd_ = compute_jsd(lprobs[i], labels[i])
+
+        if not math.isinf(jsd_):
+            jsd_batch.append(jsd_)
+
+        sp_batch.append(compute_sp(lprobs.squeeze(0)[i], shift_labels[i]))
+
+    perp = torch.log(p**(-1)).mean()
+    jsd = torch.tensor(jsd_batch).mean()
+    sp = torch.tensor(sp_batch).mean()
+
+    if repeat is not None and wrong_repeat is not None:
+        pred = torch.multinomial(lprobs, num_samples=1).squeeze(1).view(-1).tolist()
+        for context_length in [16, 32, 128, 512]:
+            cur_repeat, cur_wrong_repeat = repeat_at_1(
+                pred, shift_labels, context_length,
+                topk=cfg.top_k, topp=cfg.top_p)
+            repeat[context_length].append(cur_repeat)
+
+            wrong_repeat[context_length].append(cur_wrong_repeat)
+
+    return jsd, perp, sp
