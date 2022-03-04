@@ -251,13 +251,14 @@ def train(
                     # Log metrics
                     # Only evaluate when single GPU otherwise metrics may not average well
                     if cfg.local_rank == -1 and cfg.evaluate_during_training:
-                        jsd, ppl, sp, repeat, wrong_repeat, loss = evaluate(
+                        jsd, ppl, sp, repeat, wrong_repeat, eval_loss = evaluate(
                             cfg, model, tokenizer, cfg.eval_data_file,
-                            prefix='validation', gen_func=gen_func)
+                            prefix='validation', gen_func=gen_func, 
+                            loss_func=loss_func, device=device)
                         tb_writer.add_scalar('eval_jsd', jsd, global_step)
                         tb_writer.add_scalar('eval_ppl', ppl, global_step)
                         tb_writer.add_scalar('eval_sp', sp, global_step)
-                        tb_writer.add_scalar('eval_loss', scaled_loss, global_step)
+                        tb_writer.add_scalar('eval_loss', eval_loss, global_step)
 
                         for context_length in [16, 32, 128, 512]:
                             tb_writer.add_scalar(f'repeat_{context_length}', repeat[context_length], global_step)
@@ -510,7 +511,7 @@ def main(cfg: OmegaConf):
         logging.info("Evaluate the following checkpoints: %s", checkpoints)
 
         for checkpoint in checkpoints:
-            global_step = checkpoint.split('-')[-1] if len(checkpoints) > 1 else ""
+            global_step = 'Test' + (checkpoint.split('-')[-1] if len(checkpoints) > 1 else "")
             model = model_class.from_pretrained(checkpoint)
             model.eval()
             model.to(device)
