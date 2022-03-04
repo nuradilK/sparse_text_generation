@@ -215,12 +215,12 @@ def train(
 
                 epoch_iterator.set_description("loss: {}, perp: {}, jsd: {}, sp: {}".format(
                     format(loss.item(), '.2f'),
-                    format(batch_perp.item(), '.2f'),
+                    format(torch.exp(batch_perp).item(), '.2f'),
                     format(batch_jsd.item(), '.2f'),
                     format(batch_sp.item(), '.2f'),))
 
                 tb_writer.add_scalar('train_batch_loss', loss, global_step)
-                tb_writer.add_scalar('train_batch_perp', batch_perp, global_step)
+                tb_writer.add_scalar('train_batch_perp', torch.exp(batch_perp), global_step)
                 tb_writer.add_scalar('train_batch_jsd', batch_jsd, global_step)
                 tb_writer.add_scalar('train_batch_sp', batch_sp, global_step)
 
@@ -253,7 +253,7 @@ def train(
                     if cfg.local_rank == -1 and cfg.evaluate_during_training:
                         jsd, ppl, sp, repeat, wrong_repeat, eval_loss = evaluate(
                             cfg, model, tokenizer, cfg.eval_data_file,
-                            prefix='validation', gen_func=gen_func, 
+                            prefix='validation', gen_func=gen_func,
                             loss_func=loss_func, device=device)
                         tb_writer.add_scalar('eval_jsd', jsd, global_step)
                         tb_writer.add_scalar('eval_ppl', ppl, global_step)
@@ -471,7 +471,7 @@ def main(cfg: OmegaConf):
             torch.distributed.barrier()
 
         global_step, tr_loss = train(
-            cfg, model, tokenizer, 
+            cfg, model, tokenizer,
             loss_func, gen_func,
             n_gpu=n_gpu, device=device)
 
