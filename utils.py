@@ -244,7 +244,13 @@ def repeat_at_1(predictions, targets, context_length: int, topk=0, topp=0.0) -> 
     return total_repeat_at_1.item() / float(targets.size(1)), total_wrong_repeat_at_1.item()/float(targets.size(1))
 
 
-def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repeat=None, wrong_repeat=None) -> tuple:
+def calculate_metrics(
+        cfg: OmegaConf,
+        logits: torch.Tensor,
+        batch: list,
+        gen_func,
+        repeat=None,
+        wrong_repeat=None) -> tuple:
     shift_logits = logits[..., :-1, :].contiguous()
     shift_logits = shift_logits.view(-1, shift_logits.size(-1))
     shift_labels = batch[..., 1:].contiguous().squeeze(0).view(-1)
@@ -267,7 +273,7 @@ def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repea
         probs = [probs[i] / sums[i] for i in range(len(sums))]
         probs = torch.stack(probs)
 
-    ppl = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
+    ppl = [probs[i, shift_labels[i]] + cfg.epsilon for i in range(len(shift_labels))]
     ppl = torch.stack(ppl)
 
     sp_batch, js_batch = [], []
@@ -281,7 +287,8 @@ def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repea
 
         sp_batch.append(compute_sp(lprobs.squeeze(0)[i], shift_labels[i]))
 
-    ppl = torch.log(ppl**(-1)).mean()
+    vocab_size = logits.shape[1]
+    eps_ppl = -1 * torch.log(ppl / (1 + cfg.epsilon * vocab_size)).mean()
     js = torch.tensor(js_batch).mean()
     sp = torch.tensor(sp_batch).mean()
 
@@ -295,4 +302,4 @@ def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repea
 
             wrong_repeat[context_length].append(cur_wrong_repeat)
 
-    return js, ppl, sp
+    return js, eps_ppl, sp

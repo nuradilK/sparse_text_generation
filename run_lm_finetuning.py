@@ -183,7 +183,7 @@ def train(
     global_step, tr_loss, logging_loss = 0, 0.0, 0.0
     utils.set_seed(cfg, n_gpu)  # Added here for reproducibility (even between python 2 and 3)s
     train_iterator = trange(int(cfg.num_train_epochs), desc='Epoch', disable=cfg.local_rank not in [-1, 0])
-    best_js, best_ppl, best_sp, best_loss = 100000, 100000, 0, 100000
+    best_js, best_eps_ppl, best_sp, best_loss = 100000, 100000, 0, 100000
     model.train()
     model.zero_grad()
 
@@ -212,16 +212,16 @@ def train(
                 loss = loss / cfg.gradient_accumulation_steps
 
             if cfg.calculate_batch_scores:
-                batch_js, batch_ppl, batch_sp = utils.calculate_metrics(cfg, logits, batch, gen_func)
+                batch_js, batch_eps_ppl, batch_sp = utils.calculate_metrics(cfg, logits, batch, gen_func)
 
                 epoch_iterator.set_description('loss: {}, perp: {}, js: {}, sp: {}'.format(
                     format(loss.item(), '.2f'),
-                    format(torch.exp(batch_ppl).item(), '.2f'),
+                    format(torch.exp(batch_eps_ppl).item(), '.2f'),
                     format(batch_js.item(), '.2f'),
                     format(batch_sp.item(), '.2f'),))
 
                 tb_writer.add_scalar('train_batch_loss', loss, global_step)
-                tb_writer.add_scalar('train_batch_ppl', torch.exp(batch_ppl), global_step)
+                tb_writer.add_scalar('train_batch_eps_ppl', torch.exp(batch_eps_ppl), global_step)
                 tb_writer.add_scalar('train_batch_js', batch_js, global_step)
                 tb_writer.add_scalar('train_batch_sp', batch_sp, global_step)
 
@@ -252,13 +252,13 @@ def train(
                     # Log metrics
                     # Only evaluate when single GPU otherwise metrics may not average well
                     if cfg.local_rank == -1 and cfg.evaluate_during_training:
-                        js, ppl, sp, repeat, wrong_repeat, eval_loss = evaluate(
+                        js, eps_ppl, sp, repeat, wrong_repeat, eval_loss = evaluate(
                             cfg, model, tokenizer, cfg.eval_data_file,
                             prefix='validation', gen_func=gen_func,
                             loss_func=loss_func, device=device)
 
                         tb_writer.add_scalar('eval_js', js, global_step)
-                        tb_writer.add_scalar('eval_ppl', ppl, global_step)
+                        tb_writer.add_scalar('eval_eps_ppl', eps_ppl, global_step)
                         tb_writer.add_scalar('eval_sp', sp, global_step)
                         tb_writer.add_scalar('eval_loss', eval_loss, global_step)
 
@@ -279,9 +279,9 @@ def train(
                     if js < best_js:
                         best_js = js
                         save_model(output_dir=os.path.join(cfg.output_dir+'/best_js', 'checkpoint'))
-                    if ppl < best_ppl:
-                        best_ppl = ppl
-                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_ppl', 'checkpoint'))
+                    if eps_ppl < best_eps_ppl:
+                        best_eps_ppl = eps_ppl
+                        save_model(output_dir=os.path.join(cfg.output_dir+'/best_eps_ppl', 'checkpoint'))
                     if sp > best_sp:
                         best_sp = sp
                         save_model(output_dir=os.path.join(cfg.output_dir+'/best_sp', 'checkpoint'))
@@ -328,7 +328,7 @@ def evaluate(
     logging.info('  Batch size = %d', eval_batch_size)
 
     model.eval()
-    ppl, js, sp, loss = 0, 0, 0, 0
+    eps_ppl, js, sp, loss = 0, 0, 0, 0
     repeat, wrong_repeat = [{16: [], 32: [], 128: [], 512: []}] * 2
 
     for batch in tqdm(eval_dataloader, desc='Evaluating'):
@@ -338,17 +338,17 @@ def evaluate(
 
         logits, _ = model(inputs)
 
-        batch_js, batch_ppl, batch_sp = utils.calculate_metrics(
+        batch_js, batch_eps_ppl, batch_sp = utils.calculate_metrics(
             cfg, logits, batch, gen_func, repeat, wrong_repeat)
 
-        ppl += batch_ppl
+        eps_ppl += batch_eps_ppl
         js += batch_js
         sp += batch_sp
 
         if loss_func is not None:
             loss += utils.calculate_loss(logits, labels, loss_func)
 
-    ppl = torch.exp(ppl / len(eval_dataloader))
+    eps_ppl = torch.exp(eps_ppl / len(eval_dataloader))
     js /= len(eval_dataloader)
     sp /= len(eval_dataloader)
     loss /= len(eval_dataloader)
@@ -360,10 +360,10 @@ def evaluate(
     output_eval_file = os.path.join(cfg.output_dir, 'eval_results.txt')
     with open(output_eval_file, 'a') as writer:
         logging.info('***** Eval results {} *****'.format(prefix))
-        logging.info(f'perplexity: {ppl}')
+        logging.info(f'eps perplexity: {eps_ppl}')
         logging.info(f'js: {js}')
         logging.info(f'sp: {sp}')
-        writer.write(f'perplexity: {ppl}\n')
+        writer.write(f'eps perplexity: {eps_ppl}\n')
         writer.write(f'js: {js}\n')
         writer.write(f'sp: {sp}\n')
         if loss_func is not None:
@@ -376,7 +376,7 @@ def evaluate(
             writer.write(f'repeat_{context_length}: {repeat[context_length]}\n')
             writer.write(f'wrong_repeat_{context_length}: {wrong_repeat[context_length]}\n')
 
-    return js, ppl, sp, repeat, wrong_repeat, loss
+    return js, eps_ppl, sp, repeat, wrong_repeat, loss
 
 
 @hydra.main(config_path='cfg', config_name='config.yaml')
