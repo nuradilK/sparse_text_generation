@@ -26,7 +26,7 @@ def calculate_loss(logits, labels, loss_func):
     return loss
 
 
-def compute_jsd(p, q, base=np.e) -> torch.tensor:
+def compute_js(p, q, base=np.e) -> torch.tensor:
     p, q = p.cpu(), q.cpu()
     p = p.detach().numpy()
     q = q.detach().numpy()
@@ -177,15 +177,17 @@ def ngram_repeat_mask(xs, n) -> torch.tensor:
 
 
 def get_criterion_and_gen_func(cfg) -> tuple:
-    loss_funcs = {
+    LOSS_FUNCS = {
         "cross_entropy": nn.CrossEntropyLoss(ignore_index=-1),
         "sparsemax": SparsemaxLoss(k=cfg.entmax_k, ignore_index=-1),
         "entmax15": Entmax15Loss(k=cfg.entmax_k, ignore_index=-1),
-        "entmax": EntmaxBisectLoss(alpha=cfg.entmax_alpha, n_iter=cfg.entmax_bisect_iter, ignore_index=-1),
-        "entmax_alpha": "entmax_alpha"
+        "entmax": EntmaxBisectLoss(
+            alpha=cfg.entmax_alpha,
+            n_iter=cfg.entmax_bisect_iter,
+            ignore_index=-1),
     }
 
-    gen_funcs = {
+    GEN_FUNCS = {
         "cross_entropy": torch.softmax,
         "sparsemax": partial(sparsemax, k=cfg.entmax_k),
         "entmax15": partial(entmax15, k=cfg.entmax_k),
@@ -193,10 +195,9 @@ def get_criterion_and_gen_func(cfg) -> tuple:
             entmax_bisect,
             alpha=cfg.entmax_alpha,
             n_iter=cfg.entmax_bisect_iter),
-        "entmax_alpha": "entmax_alpha"
     }
 
-    return loss_funcs[cfg.loss],  gen_funcs[cfg.loss]
+    return LOSS_FUNCS[cfg.loss],  GEN_FUNCS[cfg.loss]
 
 
 def get_filename_suffix(cfg):
@@ -214,8 +215,6 @@ def get_filename_suffix(cfg):
         return '_nucleus_' + str(cfg.top_p)
     elif cfg.loss == 'relu':
         return 'relu'
-    elif cfg.loss == 'my_sparsemax':
-        return 'my_sparsemax'
 
 
 def repeat_at_1(predictions, targets, context_length: int, topk=0, topp=0.0) -> tuple:
@@ -268,22 +267,22 @@ def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repea
         probs = [probs[i] / sums[i] for i in range(len(sums))]
         probs = torch.stack(probs)
 
-    p = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
-    p = torch.stack(p)
+    ppl = [probs[i, shift_labels[i]] for i in range(len(shift_labels))]
+    ppl = torch.stack(ppl)
 
-    sp_batch, jsd_batch = [], []
+    sp_batch, js_batch = [], []
     labels = torch.zeros(len(shift_labels), shift_logits.size(-1))
     for i in range(len(shift_labels)):
         labels[i, shift_labels[i]] = 1
-        jsd_ = compute_jsd(lprobs[i], labels[i])
+        js_ = compute_js(lprobs[i], labels[i])
 
-        if not math.isinf(jsd_):
-            jsd_batch.append(jsd_)
+        if not math.isinf(js_):
+            js_batch.append(js_)
 
         sp_batch.append(compute_sp(lprobs.squeeze(0)[i], shift_labels[i]))
 
-    perp = torch.log(p**(-1)).mean()
-    jsd = torch.tensor(jsd_batch).mean()
+    ppl = torch.log(ppl**(-1)).mean()
+    js = torch.tensor(js_batch).mean()
     sp = torch.tensor(sp_batch).mean()
 
     if repeat is not None and wrong_repeat is not None:
@@ -296,4 +295,4 @@ def calculate_metrics(cfg: OmegaConf, logits: list, batch: list, gen_func, repea
 
             wrong_repeat[context_length].append(cur_wrong_repeat)
 
-    return jsd, perp, sp
+    return js, ppl, sp
