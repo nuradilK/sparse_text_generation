@@ -26,22 +26,22 @@ def calculate_loss(logits, labels, loss_func):
     return loss
 
 
-def compute_js(p, q, base=np.e) -> torch.tensor:
-    p, q = p.cpu(), q.cpu()
-    p = p.detach().numpy()
-    q = q.detach().numpy()
-    p, q = p / p.sum(), q / q.sum()
-    m = 1. / 2 * (p + q)
-    ent = entropy(p, m, base=base) / 2. + entropy(q, m, base=base) / 2.
+def compute_js(probs, labels, base=np.e) -> torch.tensor:
+    probs, labels = probs.cpu(), labels.cpu()
+    probs = probs.detach().numpy()
+    labels = labels.detach().numpy()
+    probs, labels = probs / probs.sum(), labels / labels.sum()
+    m = 1. / 2 * (probs + labels)
+    ent = entropy(probs, m, base=base) / 2. + entropy(labels, m, base=base) / 2.
     if ent == float('Inf'):
         ent = torch.log(torch.FloatTensor([2]))
     return ent
 
 
-def compute_sp(p, target) -> float:
-    p = np.asarray(p.cpu().detach().numpy())
-    target = target.cpu()
-    return 1 - (0.5 * np.linalg.norm(p)**2 - p[target] + 0.5)
+def compute_sp(probs, labels) -> float:
+    probs = np.asarray(probs.cpu().detach().numpy())
+    labels = labels.cpu()
+    return 1 - (0.5 * np.linalg.norm(probs)**2 - probs[labels] + 0.5)
 
 
 def softmax_temperature(X, temperature=1.0, axis=None) -> torch.tensor:
@@ -232,7 +232,7 @@ def repeat_at_1(predictions, targets, context_length: int, topk=0, topp=0.0) -> 
     prev_targets = prev_targets.masked_fill_(
         torch.ones_like(targets.expand(T, T)).byte().tril(-(context_length+1)).bool(),
         -1)
-    prev_targets = torch.tensor(prev_targets).cpu()
+    prev_targets = prev_targets.clone().detach().cpu()
 
     repeat_at_1 = (predictions[:, None] == prev_targets)
     has_repeat_at_1 = repeat_at_1.sum(1).gt(0)
