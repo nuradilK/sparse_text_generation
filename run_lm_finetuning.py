@@ -204,8 +204,7 @@ def train(
                 else:
                     loss = utils.ul_seq(model, inputs, cfg)
             else:
-                logits, _ = model(inputs)
-                loss = utils.calculate_loss(logits, labels, loss_func, gen_func)
+                loss, logits, _ = model(inputs, labels=labels)
 
             if n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -330,7 +329,7 @@ def evaluate(
         inputs = inputs.to(device)
         labels = labels.to(device)
 
-        logits, _ = model(inputs)
+        batch_loss, logits, _ = model(inputs, labels=labels)
 
         batch_js, batch_eps_ppl, batch_sp = utils.calculate_metrics(
             cfg, logits, batch, gen_func)
@@ -338,9 +337,7 @@ def evaluate(
         eps_ppl += batch_eps_ppl
         js += batch_js
         sp += batch_sp
-
-        if loss_func is not None:
-            loss += utils.calculate_loss(logits, labels, loss_func, gen_func)
+        loss += batch_loss
 
     eps_ppl = torch.exp(eps_ppl / len(eval_dataloader))
     js /= len(eval_dataloader)
@@ -434,7 +431,9 @@ def main(cfg: OmegaConf):
         model = MODEL_CLASS.from_pretrained(
             cfg.model_name_or_path,
             from_tf='.ckpt' in cfg.model_name_or_path,
-            config=config)
+            config=config,
+            loss=loss_func,
+            gen_func=gen_func)
     else:
         logging.info('Training new model from scratch')
         model = MODEL_CLASS(config=config)
