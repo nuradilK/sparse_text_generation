@@ -179,13 +179,12 @@ def ngram_repeat_mask(xs, n) -> torch.tensor:
 
 def get_criterion_and_gen_func(cfg) -> tuple:
     LOSS_FUNCS = {
-        "cross_entropy": nn.CrossEntropyLoss(ignore_index=-1),
-        "sparsemax": SparsemaxLoss(k=cfg.entmax_k, ignore_index=-1),
-        "entmax15": Entmax15Loss(k=cfg.entmax_k, ignore_index=-1),
+        "cross_entropy": nn.CrossEntropyLoss(),
+        "sparsemax": SparsemaxLoss(k=cfg.entmax_k),
+        "entmax15": Entmax15Loss(k=cfg.entmax_k),
         "entmax": EntmaxBisectLoss(
             alpha=cfg.entmax_alpha,
-            n_iter=cfg.entmax_bisect_iter,
-            ignore_index=-1),
+            n_iter=cfg.entmax_bisect_iter),
     }
 
     GEN_FUNCS = {
