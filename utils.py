@@ -15,8 +15,9 @@ from pytorch_transformers import PreTrainedTokenizer
 from entmax import SparsemaxLoss, Entmax15Loss, EntmaxBisectLoss, sparsemax, entmax15, entmax_bisect
 
 
-def calculate_loss(logits, labels, loss_func):
+def calculate_loss(logits, labels, loss_func, gen_func):
     # Shift so that tokens < n predict n
+    logits = gen_func(logits)
     shift_logits = logits[..., :-1, :].contiguous()
     shift_labels = labels[..., 1:].contiguous()
     # Flatten the tokens
@@ -247,13 +248,11 @@ def repeat_at_1(predictions, targets, context_length: int, topk=0, topp=0.0) -> 
 def calculate_metrics(
         cfg: OmegaConf,
         logits: torch.Tensor,
-        batch: list,
-        gen_func,
-        repeat=None,
-        wrong_repeat=None) -> tuple:
+        labels: list,
+        gen_func) -> tuple:
     shift_logits = logits[..., :-1, :].contiguous()
     shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    shift_labels = batch[..., 1:].contiguous().squeeze(0).view(-1)
+    shift_labels = labels[..., 1:].contiguous().squeeze(0).view(-1)
 
     if cfg.temp != 0:
         probs = softmax_temperature(shift_logits, temperature=cfg.temp, axis=1)
@@ -291,15 +290,5 @@ def calculate_metrics(
     eps_ppl = -1 * torch.log(ppl / (1 + cfg.epsilon * vocab_size)).mean()
     js = torch.tensor(js_batch).mean()
     sp = torch.tensor(sp_batch).mean()
-
-    if repeat is not None and wrong_repeat is not None:
-        pred = torch.multinomial(lprobs, num_samples=1).squeeze(1).view(-1).tolist()
-        for context_length in [16, 32, 128, 512]:
-            cur_repeat, cur_wrong_repeat = repeat_at_1(
-                pred, shift_labels, context_length,
-                topk=cfg.top_k, topp=cfg.top_p)
-            repeat[context_length].append(cur_repeat)
-
-            wrong_repeat[context_length].append(cur_wrong_repeat)
 
     return js, eps_ppl, sp

@@ -40,10 +40,10 @@ from tensorboardX import SummaryWriter
 from tqdm import tqdm, trange
 
 from pytorch_transformers import (WEIGHTS_NAME, AdamW, WarmupLinearSchedule,
-                                  BertConfig, BertForMaskedLM, BertTokenizer,
-                                  GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
-                                  OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, PreTrainedTokenizer,
-                                  RobertaConfig, RobertaForMaskedLM, RobertaTokenizer)
+                        BertConfig, BertForMaskedLM, BertTokenizer,
+                        GPT2Config, GPT2LMHeadModel, GPT2Tokenizer,
+                        OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer, PreTrainedTokenizer,
+                        RobertaConfig, RobertaForMaskedLM, RobertaTokenizer)
 
 RETOK = re.compile(r'\w+|[^\w\s]|\n', re.UNICODE)
 MODEL_CLASSES = {
@@ -87,7 +87,7 @@ class TextDataset(Dataset):
                 if hasattr(tokenizer, 'build_inputs_with_special_tokens'):
                     self.examples.append(tokenizer.build_inputs_with_special_tokens(tokenized_text[i: i + block_size]))
                 else:
-                    self.examples.append(tokenized_text[i: i + block_size])
+                    self.examples.append(tokenized_text[i: i + block_size] + (tokenizer.eos_token_id))
             # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
             # If your dataset is small, first you should loook for a bigger one :-) and second you
             # can change this behavior by adding (model specific) padding.
@@ -136,11 +136,12 @@ def train(
     optimizer = AdamW(optimizer_grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon)
 
     if cfg.max_steps > 0:
-        t_total = cfg.max_steps
+        num_training_steps = cfg.max_steps
         cfg.num_train_epochs = cfg.max_steps // (len(train_dataloader) // cfg.gradient_accumulation_steps) + 1
     else:
-        t_total = len(train_dataloader) // cfg.gradient_accumulation_steps * cfg.num_train_epochs
-    scheduler = WarmupLinearSchedule(optimizer, warmup_steps=cfg.warmup_steps, t_total=t_total)
+        num_training_steps = len(train_dataloader) // cfg.gradient_accumulation_steps * cfg.num_train_epochs
+    scheduler = WarmupLinearSchedule(
+        optimizer, warmup_steps=cfg.warmup_steps, t_total=num_training_steps)
 
     if cfg.fp16:
         try:
@@ -169,7 +170,7 @@ def train(
         train_batch_size * cfg.gradient_accumulation_steps *
         (torch.distributed.get_world_size() if cfg.local_rank != -1 else 1))
     logging.info('  Gradient Accumulation steps = %d', cfg.gradient_accumulation_steps)
-    logging.info('  Total optimization steps = %d', t_total)
+    logging.info('  Total optimization steps = %d', num_training_steps)
 
     def save_model(output_dir):
         if not os.path.exists(output_dir):
@@ -204,7 +205,7 @@ def train(
                     loss = utils.ul_seq(model, inputs, cfg)
             else:
                 logits, _ = model(inputs)
-                loss = utils.calculate_loss(logits, labels, loss_func)
+                loss = utils.calculate_loss(logits, labels, loss_func, gen_func)
 
             if n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -252,7 +253,7 @@ def train(
                     # Log metrics
                     # Only evaluate when single GPU otherwise metrics may not average well
                     if cfg.local_rank == -1 and cfg.evaluate_during_training:
-                        js, eps_ppl, sp, repeat, wrong_repeat, eval_loss = evaluate(
+                        js, eps_ppl, sp, eval_loss = evaluate(
                             cfg, model, tokenizer, cfg.eval_data_file,
                             prefix='validation', gen_func=gen_func,
                             loss_func=loss_func, device=device)
@@ -261,12 +262,6 @@ def train(
                         tb_writer.add_scalar('eval_eps_ppl', eps_ppl, global_step)
                         tb_writer.add_scalar('eval_sp', sp, global_step)
                         tb_writer.add_scalar('eval_loss', eval_loss, global_step)
-
-                        for context_length in [16, 32, 128, 512]:
-                            tb_writer.add_scalar(f'repeat_{context_length}', repeat[context_length], global_step)
-                            tb_writer.add_scalar(
-                                f'wrong_repeat_{context_length}',
-                                wrong_repeat[context_length], global_step)
 
                     tb_writer.add_scalar('lr', scheduler.get_lr()[0], global_step)
                     tb_writer.add_scalar(
@@ -329,7 +324,6 @@ def evaluate(
 
     model.eval()
     eps_ppl, js, sp, loss = 0, 0, 0, 0
-    repeat, wrong_repeat = [{16: [], 32: [], 128: [], 512: []}] * 2
 
     for batch in tqdm(eval_dataloader, desc='Evaluating'):
         inputs, labels = utils.mask_tokens(batch, tokenizer, cfg) if cfg.mlm else (batch, batch)
@@ -339,23 +333,19 @@ def evaluate(
         logits, _ = model(inputs)
 
         batch_js, batch_eps_ppl, batch_sp = utils.calculate_metrics(
-            cfg, logits, batch, gen_func, repeat, wrong_repeat)
+            cfg, logits, batch, gen_func)
 
         eps_ppl += batch_eps_ppl
         js += batch_js
         sp += batch_sp
 
         if loss_func is not None:
-            loss += utils.calculate_loss(logits, labels, loss_func)
+            loss += utils.calculate_loss(logits, labels, loss_func, gen_func)
 
     eps_ppl = torch.exp(eps_ppl / len(eval_dataloader))
     js /= len(eval_dataloader)
     sp /= len(eval_dataloader)
     loss /= len(eval_dataloader)
-
-    for context_length in [16, 32, 128, 512]:
-        repeat[context_length] = np.array(repeat[context_length]).mean()
-        wrong_repeat[context_length] = np.array(wrong_repeat[context_length]).mean()
 
     output_eval_file = os.path.join(cfg.output_dir, 'eval_results.txt')
     with open(output_eval_file, 'a') as writer:
@@ -370,13 +360,7 @@ def evaluate(
             logging.info(f'loss: {loss}')
             writer.write(f'loss: {loss}\n')
 
-        for context_length in [16, 32, 128, 512]:
-            logging.info(f'repeat_{context_length}: {repeat[context_length]}')
-            logging.info(f'wrong_repeat_{context_length}: {wrong_repeat[context_length]}')
-            writer.write(f'repeat_{context_length}: {repeat[context_length]}\n')
-            writer.write(f'wrong_repeat_{context_length}: {wrong_repeat[context_length]}\n')
-
-    return js, eps_ppl, sp, repeat, wrong_repeat, loss
+    return js, eps_ppl, sp, loss
 
 
 @hydra.main(config_path='cfg', config_name='config.yaml')
